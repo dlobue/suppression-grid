@@ -1,11 +1,12 @@
 (ns suppression-grid-devcards.core
-    (:require
-     [devcards.core :as dc :include-macros true]
-     [suppression-grid.core :as suppression-grid] 
-     #_[om.core :as om :include-macros true]
-     #_[sablono.core :as sab :include-macros true])
-    (:require-macros
-     [devcards.core :refer [defcard is are= are-not=]]))
+  (:require [devcards.core :as dc :include-macros true]
+            [cljs.core.async :refer [put!]]
+            [goog.string :as gstring]
+            [goog.string.format]
+            [om-tools.dom :as d :include-macros true]
+            [om-tools.core :refer-macros [defcomponent defcomponentk defcomponentmethod]]
+            [suppression-grid.core :as sg])
+  (:require-macros [devcards.core :refer [defcard is are= are-not=]]))
 
 (enable-console-print!)
 
@@ -15,23 +16,71 @@
 ;; remember to run lein figwheel and then browse to
 ;; http://localhost:3449/devcards/index.html
 
-(defcard devcard-intro
-  (dc/markdown-card
-   "# Devcards for suppression-grid
 
-    I can be found in `devcards_src/suppression_grid_devcards/core.cljs`.
+(defn ack-entry-handler [state]
+  (-> (:text @state)
+      js/JSON.parse
+      js->clj
+      sg/conjack!))
 
-    If you add cards to this file, they will appear here on this page.
 
-    You can add devcards to any file as long as you require
-    `devcards.core` like so:
+(def ingest_services
+  ["ingest.com.rackspacecloud.blueflood.io.ElasticIO.Write Duration.p95"
+   "ingest.com.rackspacecloud.blueflood.io.Instrumentation.Full Resolution Metrics Written.m1_rate"
+   "ingest.com.rackspacecloud.blueflood.inputs.handlers.HttpMetricsIngestionHandler.HTTP Ingestion json processing timer.p95"
+   "ingest.com.rackspacecloud.blueflood.inputs.handlers.HttpMetricsIngestionHandler.HTTP Ingestion persisting timer.p95"
+   "ingest.com.rackspacecloud.blueflood.inputs.handlers.HttpMetricsIngestionHandler.HTTP Ingestion response sending timer.p95"])
 
-    ```
-    (:require [devcards.core :as dc :include-macros true])
-    ```
+(def db_services
+  ["rollup.com.rackspacecloud.blueflood.service.RollupService.Rollup Execution Timer.p95"
+   "rollup.com.rackspacecloud.blueflood.service.RollupService.Scheduled Slot Check"])
 
-    As you add cards to other namspaces, those namspaces will
-    be listed on the Devcards **home** page.
+(def gen-config [[ "db%i.iad.prod.bf.k1k.me", 32, db_services], [ "app%i.iad.prod.bf.k1k.me", 2, ingest_services]])
 
-    <a href=\"https://github.com/bhauman/devcards/blob/master/example_src/devdemos/core.cljs\" target=\"_blank\">Here are some Devcard examples</a>"))
+(defn new-event [h s]
+  {:host h
+   :service s
+   :metric (rand-int 9345093)
+   :time (-> (js/Date.) .getTime (quot 1000))
+   :state (rand-nth '("ok" "critical" "warning"))})
 
+(defn gen-events-for-host-type [FORMAT NUM SERVICES]
+  (doseq [h (map #(gstring/format FORMAT %) (range NUM))
+          s SERVICES]
+    (put! sg/ingest-channel (new-event h s))))
+
+(defn gen-events [args]
+  (doseq [[FORMAT NUM SERVICES] args]
+    (gen-events-for-host-type FORMAT NUM SERVICES)))
+
+
+
+
+
+(defcomponentk doom-item [data owner state]
+  (init-state [_] {:text ""})
+  (render
+   [_]
+   (d/div
+    (d/button {:on-click (fn [_] (gen-events gen-config))} "Generate events")
+    (d/button {:on-click #(sg/get-ackdb data)} "Get ackdb")
+    (d/br)
+
+    (d/input
+     {:feedback? true
+      :type "text"
+      :placeholder "ackdb entry"
+      :on-change #(sg/handle-change owner state)})
+
+    (d/button {:on-click #(ack-entry-handler state)} "Submit to ackdb"))))
+
+
+
+
+(defcard doom-card
+  (dc/om-root-card doom-item sg/app-state))
+
+
+
+(defcard new-app-root
+  (dc/om-root-card sg/servers sg/app-state))
