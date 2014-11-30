@@ -1,26 +1,33 @@
 (ns suppression-grid.core
   (:require [om.core :as om :include-macros true]
-            [om.dom :as dom :include-macros true]
-            [cljs.core.async :refer [put! chan <! onto-chan to-chan]]
-            [om-bootstrap.panel :as p]
-            [om-bootstrap.input :as i]
-            [om-bootstrap.random :as r]
-            [om-bootstrap.button :as b]
+            [plumbing.core :refer-macros [defnk fnk for-map]]
+            [figwheel.client :as fw :include-macros true]
+            [cljs.core.async :refer [put! chan <! onto-chan to-chan timeout]]
+            [secretary.core :as secretary :refer-macros [defroute]]
             [om-tools.dom :as d :include-macros true]
             [om-tools.core :refer-macros [defcomponent defcomponentk]]
             [ninjudd.eventual.client :refer [json-event-source close-event-source!]]
             [goog.string :as gstring]
             [goog.string.format]
-            [cljs-http.client :as http])
-  (:require-macros [cljs.core.async.macros :refer [go]]))
+            [bootstrap-cljs :as bs :include-macros true]
+            [suppression-grid.router :as router]
+            [cljs-http.client :as http]
+            [cljs-http.util :refer [build-url]])
+  (:require-macros [cljs.core.async.macros :refer [go go-loop]]))
 
 (enable-console-print!)
+(fw/watch-and-reload
+ :jsload-callback (fn [] (print "reloaded")))
 
 (defonce app-state (atom {:ackdb {}
+                          :router {}
+                          :config {:riemann-sse-url "http://localhost:5558/index"
+                                   :riemann-sse-query "true"
+                                   :suppression-poll-interval nil
+                                   :suppression-url "http://localhost:5559/acks"}
                           :server-states (sorted-map
                                           "HOSTNAME-A"
-                                          {:maintenance-mode false
-                                           :service-states
+                                          {:service-states
                                            (sorted-map
                                             "SERVICE-A"
                                             {:state "ok"
@@ -34,7 +41,7 @@
                                              :metric 333})
                                            }
                                           "HOSTNAME-C"
-                                          {:maintenance-mode false
+                                          {
                                            :service-states
                                            (sorted-map
                                             "SERVICE-D"
@@ -49,6 +56,15 @@
                                              :metric 333})}
                                           )}))
 
+
+
+(defn config->req [{:keys [riemann-sse-url riemann-sse-query]
+                    :or {riemann-sse-query "true"}}]
+  {:url riemann-sse-url
+   :query-params {:query riemann-sse-query}})
+
+
+(defn config-ref [] (om/ref-cursor (:config (om/root-cursor app-state))))
 (defn ackdb-ref [] (om/ref-cursor (:ackdb (om/root-cursor app-state))))
 
 (defn conjack!
@@ -56,7 +72,9 @@
   ;; ([member]
   ;;    (swap! ackdb conj (vec member)))
   ([cursor member]
-     (om/transact! cursor #(assoc % (vec member) nil))
+     (conjack! cursor nil member))
+  ([cursor korks member]
+     (om/transact! cursor korks #(assoc % (vec member) nil))
      ;(om/transact! cursor #(conj % (vec member)))
      ))
 
@@ -65,9 +83,29 @@
   ;; ([member]
   ;;    (swap! ackdb disj (vec member)))
   ([cursor member]
-     (om/transact! cursor #(dissoc % (vec member)))
+     (disjack! cursor nil member))
+  ([cursor korks member]
+     (om/transact! cursor korks #(dissoc % (vec member)))
      ;(om/transact! cursor #(disj % (vec member)))
      ))
+
+
+(defn wrap-build-url [client]
+  (fn [request]
+    (if-not (string? request)
+      (client (build-url request))
+      (client request))))
+
+
+(defn wrap-client
+  [client]
+  (-> client
+      wrap-build-url
+      http/wrap-query-params
+      http/wrap-url))
+
+(def wrapped-sse-client
+  (wrap-client json-event-source))
 
 
 (defn update-cursor [{:keys [state service host] :as n} cursor]
@@ -96,7 +134,6 @@
 (defn get-now []
   (-> (js/Date.) .getTime (quot 1000)))
 
-
 (defn riemann-sse-middleman [in-ch out-ch]
   (go (loop [mark (get-now) buf nil]
         (when-let [e (<! in-ch)]
@@ -111,19 +148,44 @@
             (recur mark buf))))))
 
 
-(defn init-riemann-sse [url state]
+(defn init-riemann-sse [sse-config state]
   (when-let [sse-info (get @state :sse-info)]
     (close-event-source! sse-info))
-  (let [{:keys [channel] :as sse-info} (json-event-source url)
+  (let [{:keys [channel] :as sse-info} (wrapped-sse-client
+                                        (config->req @sse-config))
         {:keys [ingest-channel]} @state]
     (swap! state assoc :sse-info sse-info)
     (riemann-sse-middleman channel ingest-channel)))
 
 (def ingest-channel (chan))
 
+
+
+(defn poll-ackdb [cursor]
+  (let [poll-interval (-> @cursor
+                          (get-in [:config :suppression-poll-interval])
+                          js/parseInt
+                          (* 1000))
+        poll-interval (when (and (number? poll-interval)
+                                 (not (js/isNaN poll-interval))
+                                 (> 1000 poll-interval))
+                        poll-interval)]
+    (go-loop []
+      (let [{:keys [body] :as response}
+            (<! (http/get (get-in @cursor [:config :suppression-url])))]
+        (om/update! cursor :ackdb
+                    ;; TODO: create SetCursor so we don't have cludge
+                    ;;(set body)
+                    (zipmap body (repeat nil)))
+        (when poll-interval
+          (<! (timeout poll-interval))
+          (recur))))))
+
+
+
 (defn get-ackdb [cursor]
   (go (let [{:keys [body] :as response}
-            (<! (http/get "http://localhost:5559/acks"))]
+            (<! (http/get (get-in @cursor [:config :suppression-url])))]
         (om/update! cursor :ackdb
                     ;;(set body)
                     (zipmap body (repeat nil))))))
@@ -139,7 +201,7 @@
     (when (some nil? ack-item)
       (throw (ex-info "Host and service must not be nil!"
                       {:type :bad-data :data ack-item})))
-    (go (let [response (<! (http-fn "http://localhost:5559/acks"
+    (go (let [response (<! (http-fn (:suppression-url @(config-ref))
                                     {:json-params ack-item}))]
 
           ;;TODO: handle error conditions? log errors?
@@ -186,27 +248,99 @@
         (has-substr service match)))
     data)))
 
+
+(defcomponentk config-modal [data owner]
+  (init-state
+   [_]
+   {:riemann-sse-url (:riemann-sse-url @data)
+    :riemann-sse-query (:riemann-sse-query @data)
+    :suppression-url (:suppression-url @data)
+    :suppression-poll-interval (:suppression-poll-interval @data)
+    :visible? false})
+  (render-state
+   [_ {:keys [visible?] :as state}]
+   (d/div {:class "pull-right"}
+          (bs/button {:on-click #(om/set-state! owner :visible? true)}
+                     (bs/glyphicon {:glyph "cog"}))
+          (when visible?
+            (bs/modal {:title "Configure"
+                       :animated false
+                       :on-request-hide #(om/set-state! owner :visible? false)}
+                      (let [input-helper (fnk [key label help]
+                                              (bs/input {:type "text"
+                                                         :label label
+                                                         :feedback? true
+                                                         :addon-after
+                                                         (bs/overlay-trigger
+                                                          {:placement "top"
+                                                           :overlay
+                                                           (bs/tooltip help)}
+                                                          (bs/glyphicon {:glyph "question-sign"}))
+                                                         :value (get state key)
+                                                         :on-change #(om/set-state!
+                                                                      owner
+                                                                      key
+                                                                      (.. % -target -value))}))]
+                        (bs/accordion {:class "modal-body"
+                                       :default-active-key "riemann"}
+                                      (bs/panel {:header "Riemann SSE"
+                                                 :key "riemann"}
+                                                (input-helper
+                                                 {:key :riemann-sse-url
+                                                  :label "Url"
+                                                  :help "Riemann SSE endpoint url"})
+                                                (input-helper
+                                                 {:key :riemann-sse-query
+                                                  :label "query"
+                                                  :help "Riemann Event filter"}))
+                                      (bs/panel {:header "Suppressions"
+                                                 :key "suppressions"}
+                                                (input-helper
+                                                 {:key :suppression-url
+                                                  :label "Url"
+                                                  :help "Suppressions endpoint url"})
+                                                (input-helper
+                                                 {:key :suppression-poll-interval
+                                                  :label "Poll Interval"
+                                                  :help "Interval to poll suppression endpoint for updates in seconds"}))))
+                      (d/div {:class "modal-footer"}
+                             (bs/button {:on-click
+                                         (fn [_]
+                                           (om/update-state!
+                                            owner
+                                            #(assoc @data
+                                               :visible? false)))}
+                                        "Close")
+                             (bs/button {:bs-style "primary"
+                                         :on-click #(do
+                                                      (om/transact!
+                                                       data
+                                                       (fn [_]
+                                                         (dissoc state :visible?)))
+                                                      (om/set-state! owner :visible? false))
+                                         }
+                                        "Done")))))))
+
 (defcomponentk ack-widget [data owner [:shared host ack-service-name]]
   (render
    [_]
    (let [acks (om/observe owner (ackdb-ref))]
      (if (contains? acks [host ack-service-name])
-       (b/button {:bs-size "xsmall"
-                  :bs-style "danger"
-                  :class "pull-right"
-                  :on-click #(ack-dispatcher :del acks host ack-service-name)}
-                 "Remove Ack")
+       (bs/button {:bs-size "xsmall"
+                   :bs-style "danger"
+                   :class "pull-right"
+                   :on-click #(ack-dispatcher :del acks host ack-service-name)}
+                  "Remove Ack")
 
-       (b/button {:bs-size "xsmall"
-                  :class "pull-right"
-                  :on-click #(ack-dispatcher :add acks host ack-service-name)}
-                 "Ack")))))
-
+       (bs/button {:bs-size "xsmall"
+                   :class "pull-right"
+                   :on-click #(ack-dispatcher :add acks host ack-service-name)}
+                  "Ack")))))
 
 (defcomponentk service [[:data service metric state] [:shared host]]
   (render
    [_]
-   (d/li {:class "list-group-item"}
+   (bs/list-group-item
          (gstring/format
           "servicename: %s metric: %s state: %s"
           service metric state)
@@ -214,38 +348,38 @@
                    {:shared {:host host
                              :ack-service-name service}}))))
 
-
 (defcomponent server [[hostname cursor] owner]
   (render
    [this]
-   ;(.info js/console (str (-> (js/Date.) .getTime (quot 1000)) " rendering server"))
-   (p/panel
-    {:header (list hostname
-                   (->ack-widget
-                    {}
-                    {:shared {:host hostname
-                              :ack-service-name "maintenance-mode"}}))
-     :list-group
-     (d/ul
-      {:class "list-group"}
-      (om/build-all
-       service
-       (:service-states cursor)
-       #_(filter-services
-          (:service-states cursor)
-          (om/get-state owner :text))
-       {:key :service
-        :fn second
-        :shared {:host hostname
-                 :ack-service-name "maintenance-mode"}}))})))
+   (bs/panel
+    {:header (d/span
+              (d/a {:href (str "#/server/" hostname)}
+                   hostname)
+              (->ack-widget
+               {}
+               {:shared {:host hostname
+                         :ack-service-name "maintenance-mode"}}))}
+    (bs/list-group
+     (om/build-all
+      service
+      (:service-states cursor)
+      #_(filter-services
+         (:service-states cursor)
+         (om/get-state owner :text))
+      {:key :service
+       :fn second
+       :shared {:host hostname
+                :ack-service-name "maintenance-mode"}})))))
 
-(defcomponent hard-to-fail [cursor owner]
+(defcomponent server-solo [data owner]
   (render
-   [this]
-   (d/li {:class "list-group-item"} (str cursor))))
+   [_]
+   (let [hostname (get-in data [:router :params :name])
+         cursor (get-in data [:server-states hostname])]
+     (->server [hostname cursor]))))
 
 
-(defcomponentk servers [[:data server-states :as data] owner state]
+(defcomponentk servers [[:data server-states config :as data] owner state]
   (init-state
    [_]
    {:text ""
@@ -253,7 +387,6 @@
     :ingest-channel ingest-channel})
   (will-mount
    [_]
-   (.info js/console (str (-> (js/Date.) .getTime (quot 1000)) " will-mount servers"))
    (let [{:keys [ingest-channel]} @state]
      (insert-cursor server-states ingest-channel)))
   (will-unmount
@@ -262,27 +395,35 @@
      (close-event-source! sse-info)))
   (render
    [_]
-   ;(.info js/console (str (-> (js/Date.) .getTime (quot 1000)) " rendering servers"))
    (d/div
-    (b/button {:on-click
-               #(init-riemann-sse "http://localhost:5558/index?query=true" state)}
-              "connect to riemann")
-    (b/button {:on-click #(when-let [sse-info (:sse-info @state)]
-                            (close-event-source! sse-info))}
-              "disconnect from riemann")
-    (b/button {:on-click #(get-ackdb data)} "refresh ackdb")
-    (i/input
+    (bs/button-group
+     (bs/button {:on-click
+                #(init-riemann-sse config state)}
+               "connect to riemann")
+     (bs/button {:on-click #(when-let [sse-info (:sse-info @state)]
+                             (close-event-source! sse-info))}
+               "disconnect from riemann")
+     (bs/button {:on-click #(get-ackdb data)} "refresh ackdb"))
+    (->config-modal config)
+    (bs/input
      {:feedback? true
       :type "text"
+      :ref "input"
       :placeholder "Filter"
-      :on-change #(handle-change owner state)})
-    (p/panel
-     {:class "panel-group"}
+      :on-change #(om/set-state!
+                   owner
+                   :text
+                   (.. % -target -value))})
+    (bs/panel-group
      (om/build-all
       server
       (filter-servers server-states (:text @state))
       {:key 0
        :state {:text (:text @state)}})))))
 
-(om/root servers app-state
-  {:target (.getElementById js/document "app")})
+
+(def routes ["/" servers
+             "/server/:name" server-solo])
+
+(when-let [app-element (.getElementById js/document "app")]
+  (om/root (router/init routes app-state) app-state {:target app-element}))

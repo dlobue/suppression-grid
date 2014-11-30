@@ -11,6 +11,7 @@
                  [secretary "1.2.0"]
                  [com.ninjudd/eventual "0.4.1"]
                  [racehub/om-bootstrap "0.3.1" :exclusions  [org.clojure/clojure]]
+                 [bootstrap-cljs "0.0.4"]
                  [om "0.8.0-alpha2"]
                  [cljs-http "0.1.20"]
                  [prismatic/om-tools "0.3.6"]
@@ -39,7 +40,7 @@
                                    :pretty-print true
                                    :source-map true}}
 
-                       {:id "app"
+                       {:id "main"
                           :source-paths ["src"]
                           :compiler {
                                      :output-to "resources/public/js/compiled/suppression_grid.js"

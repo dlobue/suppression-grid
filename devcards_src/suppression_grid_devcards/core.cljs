@@ -1,10 +1,16 @@
 (ns suppression-grid-devcards.core
   (:require [devcards.core :as dc :include-macros true]
+            [om.core :as om :include-macros true]
             [cljs.core.async :refer [put!]]
             [goog.string :as gstring]
             [goog.string.format]
+            [om-bootstrap.panel :as p]
+            [om-bootstrap.input :as i]
+            [om-bootstrap.random :as r]
+            [om-bootstrap.button :as b]
             [om-tools.dom :as d :include-macros true]
             [om-tools.core :refer-macros [defcomponent defcomponentk defcomponentmethod]]
+            [bootstrap-cljs :as bs :include-macros true]
             [suppression-grid.core :as sg])
   (:require-macros [devcards.core :refer [defcard is are= are-not=]]))
 
@@ -18,10 +24,10 @@
 
 
 (defn ack-entry-handler [state]
-  (-> (:text @state)
+  (->> (:text @state)
       js/JSON.parse
       js->clj
-      sg/conjack!))
+      (sg/conjack! sg/ackdb-ref)))
 
 
 (def ingest_services
@@ -80,6 +86,19 @@
 (defcard doom-card
   (dc/om-root-card doom-item sg/app-state))
 
+
+(defcomponentk config-test [[:data config]]
+  (render
+   [_]
+   (d/div
+    (sg/->test-modal config)
+    (d/br)
+    (sg/->config-modal config)
+    (d/br)
+    (sg/->config-form config))))
+
+(defcard config-card
+  (dc/om-root-card config-test sg/app-state))
 
 
 (defcard new-app-root

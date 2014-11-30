@@ -1,1 +1,8 @@
 /* devcards-clean CSS */
+
+.panel-body {
+    padding: 0 !important;
+}
+.list-group {
+    margin-bottom: 0 !important;
+}
