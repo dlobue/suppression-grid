@@ -12,14 +12,7 @@
     (add-route! route #(swap! app assoc :router {:view view :params %})))
 
   (goog.events/listen history EventType/NAVIGATE #(-> % .-token dispatch!))
-  (.setEnabled history true)
-
-  ;; (om/component
-  ;;  (om/build (get-in app [:router :view]) app))
-
-  (fn [app owner]
-    (reify om/IRender
-      (render [this] (om/build (get-in app [:router :view]) app)))))
+  (.setEnabled history true))
 
 (defn redirect [location]
   (.setToken history location))

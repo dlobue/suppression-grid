@@ -23,6 +23,7 @@
                           :router {}
                           :config {:riemann-sse-url "http://localhost:5558/index"
                                    :riemann-sse-query "true"
+                                   :ackdb-poller-running nil
                                    :suppression-poll-interval nil
                                    :suppression-url "http://localhost:5559/acks"}
                           :server-states (sorted-map
@@ -162,14 +163,20 @@
 
 
 (defn poll-ackdb [cursor]
+  ;; only start the poller if ackdb-poller-running is nil. false
+  ;; means shutting down, true means running.
+  (om/update! cursor [:config :ackdb-poller-running] true)
   (let [poll-interval (-> @cursor
                           (get-in [:config :suppression-poll-interval])
                           js/parseInt
                           (* 1000))
         poll-interval (when (and (number? poll-interval)
                                  (not (js/isNaN poll-interval))
-                                 (> 1000 poll-interval))
+                                 (> poll-interval 1000))
                         poll-interval)]
+    (.info js/console (str (-> (js/Date.) .getTime (quot 1000))
+                           " polling ackdb server for updates at interval: " poll-interval))
+
     (go-loop []
       (let [{:keys [body] :as response}
             (<! (http/get (get-in @cursor [:config :suppression-url])))]
@@ -179,7 +186,11 @@
                     (zipmap body (repeat nil)))
         (when poll-interval
           (<! (timeout poll-interval))
-          (recur))))))
+          (if-not (get-in @cursor [:config :ackdb-poller-running])
+            (do
+              (.info js/console (str "got the word to stop polling ackdb"))
+              (om/update! cursor [:config :ackdb-poller-running] nil))
+            (recur)))))))
 
 
 
@@ -263,7 +274,12 @@
           (bs/button {:on-click #(om/set-state! owner :visible? true)}
                      (bs/glyphicon {:glyph "cog"}))
           (when visible?
-            (bs/modal {:title "Configure"
+            (bs/modal {:title (d/span "Configure"
+                                    (bs/button {:class "close"
+                                                :aria-hidden true
+                                                :on-click #(om/set-state! owner :visible? false)}
+                                               "x"))
+                       :close-button false
                        :animated false
                        :on-request-hide #(om/set-state! owner :visible? false)}
                       (let [input-helper (fnk [key label help]
@@ -319,7 +335,7 @@
                                                          (dissoc state :visible?)))
                                                       (om/set-state! owner :visible? false))
                                          }
-                                        "Done")))))))
+                                        "Save")))))))
 
 (defcomponentk ack-widget [data owner [:shared host ack-service-name]]
   (render
@@ -365,7 +381,7 @@
       (:service-states cursor)
       #_(filter-services
          (:service-states cursor)
-         (om/get-state owner :text))
+         (om/get-state owner :filter-text))
       {:key :service
        :fn second
        :shared {:host hostname
@@ -378,8 +394,25 @@
          cursor (get-in data [:server-states hostname])]
      (->server [hostname cursor]))))
 
+(defcomponentk servers [[:data server-states] [:shared filter-text]]
+  (render
+   [_]
+   (bs/panel-group
+    (om/build-all
+     server
+     (filter-servers server-states filter-text)
+     {:key 0
+      :state {:filter-text filter-text}}))))
 
-(defcomponentk servers [[:data server-states config :as data] owner state]
+
+
+(def routes ["/" servers
+             "/server/:name" server-solo])
+
+
+
+
+(defcomponentk root-component [[:data server-states config :as data] owner state]
   (init-state
    [_]
    {:text ""
@@ -397,13 +430,26 @@
    [_]
    (d/div
     (bs/button-group
-     (bs/button {:on-click
-                #(init-riemann-sse config state)}
-               "connect to riemann")
-     (bs/button {:on-click #(when-let [sse-info (:sse-info @state)]
-                             (close-event-source! sse-info))}
-               "disconnect from riemann")
-     (bs/button {:on-click #(get-ackdb data)} "refresh ackdb"))
+     (if-let [sse-info (:sse-info @state)]
+       (bs/button {:on-click #(do
+                                (close-event-source! sse-info)
+                                (swap! state assoc :sse-info nil))}
+                  "disconnect from riemann")
+       (bs/button {:on-click
+                   #(init-riemann-sse config state)}
+                  "connect to riemann"))
+
+    (.info js/console (str (-> (js/Date.) .getTime (quot 1000))
+                           " ackdb-poller-running status:" (get-in config [:ackdb-poller-running])))
+     (if (nil? (get-in config [:ackdb-poller-running]))
+       ;; only start the poller if ackdb-poller-running is nil. false
+       ;; means shutting down, true means running.
+       (bs/button {:on-click #(do
+                                (om/update! config :ackdb-poller-running true)
+                                (poll-ackdb data))}
+                  "refresh ackdb")
+       (bs/button {:on-click #(om/update! config :ackdb-poller-running false)}
+                  "stop ackdb poller")))
     (->config-modal config)
     (bs/input
      {:feedback? true
@@ -414,16 +460,13 @@
                    owner
                    :text
                    (.. % -target -value))})
-    (bs/panel-group
-     (om/build-all
-      server
-      (filter-servers server-states (:text @state))
-      {:key 0
-       :state {:text (:text @state)}})))))
-
-
-(def routes ["/" servers
-             "/server/:name" server-solo])
+    (om/build
+     (get-in data [:router :view])
+     data
+     {:shared {:filter-text (:text @state)}}))))
 
 (when-let [app-element (.getElementById js/document "app")]
-  (om/root (router/init routes app-state) app-state {:target app-element}))
+  (router/init routes app-state)
+  (om/root
+   root-component
+   app-state {:target app-element}))
